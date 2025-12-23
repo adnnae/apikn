@@ -1,0 +1,13 @@
+-- Vérifier tous les triggers sur la table users
+SHOW TRIGGERS WHERE `Table` = 'users';
+
+-- Voir le détail des triggers
+SELECT 
+  TRIGGER_NAME,
+  EVENT_MANIPULATION,
+  EVENT_OBJECT_TABLE,
+  ACTION_TIMING,
+  ACTION_STATEMENT
+FROM INFORMATION_SCHEMA.TRIGGERS
+WHERE EVENT_OBJECT_SCHEMA = 'knachsoft'
+  AND EVENT_OBJECT_TABLE = 'users';

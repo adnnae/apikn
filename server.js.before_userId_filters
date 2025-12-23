@@ -1,0 +1,1543 @@
+require('dotenv').config();
+const express = require('express');
+const cors = require('cors');
+const { pool, testConnection } = require('./db');
+// ============================================================================
+// IMPORTS JWT - AJOUTÉ PAR apply_jwt_to_server.js
+// ============================================================================
+const { router: authRouter, initPool: initAuthPool } = require('./routes/auth');
+const { authMiddleware, requireRole } = require('./middleware/auth');
+
+
+const app = express();
+const PORT = process.env.PORT || 4000;
+
+app.use(cors({ origin: '*' }));
+// Augmenter la limite pour les images Base64 (50MB)
+app.use(express.json({ limit: '50mb' }));
+app.use(express.urlencoded({ limit: '50mb', extended: true }));
+// ============================================================================
+// INITIALISER LE POOL POUR LES ROUTES AUTH - AJOUTÉ PAR apply_jwt_to_server.js
+// ============================================================================
+initAuthPool(pool);
+
+
+// Health check
+app.get('/api/health', async (req, res) => {
+  try {
+    await testConnection();
+    res.json({ status: 'ok', db: 'connected' });
+// ============================================================================
+// ROUTES D'AUTHENTIFICATION (NON PROTÉGÉES) - AJOUTÉ PAR apply_jwt_to_server.js
+// ============================================================================
+app.use('/api/auth', authRouter);
+
+// ============================================================================
+// TOUTES LES ROUTES CI-DESSOUS SONT MAINTENANT PROTÉGÉES PAR JWT
+// ============================================================================
+
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ status: 'error', error: e.message });
+  }
+});
+
+// Example: produits CRUD
+app.get('/api/produits', authMiddleware, async (req, res) => {
+  const userId = req.userId; // ✅ Extrait du JWT
+  const maxRetries = 3;
+  let retries = 0;
+  
+  while (retries < maxRetries) {
+    try {
+      const [rows] = await pool.query('SELECT * FROM produits LIMIT 500');
+      res.json(rows);
+      return; // Succès, sortir de la boucle
+    } catch (e) {
+      retries++;
+      console.error(`Erreur GET /produits (tentative ${retries}/${maxRetries}):`, e);
+      
+      // Si erreur de connexion, attendre et réessayer
+      if ((e.code === 'PROTOCOL_CONNECTION_LOST' || 
+           e.code === 'ETIMEDOUT' ||
+           e.code === 'ER_NET_READ_INTERRUPTED') && 
+          retries < maxRetries) {
+        const delaySeconds = retries * 3; // Délai progressif: 3s, 6s, 9s
+        console.log(`🔄 Reconnexion dans ${delaySeconds} secondes... (${retries}/${maxRetries})`);
+        console.log(`   Serveur MySQL: ${process.env.DB_HOST}:${process.env.DB_PORT || 3306}`);
+        await new Promise(resolve => setTimeout(resolve, delaySeconds * 1000));
+        continue; // Réessayer
+      }
+      
+      // Si dernière tentative ou autre erreur
+      res.status(500).json({ error: e.message });
+      return;
+    }
+  }
+});
+
+app.get('/api/produits/:id', async (req, res) => {
+  try {
+    const [rows] = await pool.query('SELECT * FROM produits WHERE id = ?', [req.params.id]);
+    if (rows.length === 0) return res.status(404).json({ error: 'Produit non trouvé' });
+    res.json(rows[0]);
+  } catch (e) {
+    console.error('Erreur GET /produits/:id:', e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.post('/api/produits', authMiddleware, async (req, res) => {
+  const userId = req.userId; // ✅ Extrait du JWT
+  try {
+    const {
+      nom,
+      reference,
+      prixAchat,
+      prixVente,
+      quantite = 0,
+      marchandiseId = 1,
+      userId = 1,
+      categorieId,
+      codebar,
+      description,
+      prixGros,
+      prixPromotion,
+      seuilAlerte,
+      imageBase64,
+      dateExpiration,
+      joursAlerteExpiration,
+      deviceId,
+    } = req.body;
+
+    if (!nom || !reference || prixAchat == null || prixVente == null) {
+      return res.status(400).json({ error: 'Champs obligatoires manquants' });
+    }
+
+    const now = new Date();
+    
+    // ✅ UTILISER INSERT ... ON DUPLICATE KEY UPDATE pour éviter les erreurs duplicate
+    const [result] = await pool.query(
+      `INSERT INTO produits
+       (userId, marchandiseId, nom, reference, categorieId, codebar, description,
+        prixAchat, prixVente, prixGros, prixPromotion, quantite, seuilAlerte,
+        imageBase64, dateCreation, dateModification, dateExpiration, joursAlerteExpiration, deviceId, lastModified)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+       ON DUPLICATE KEY UPDATE
+         nom = VALUES(nom),
+         categorieId = VALUES(categorieId),
+         codebar = VALUES(codebar),
+         description = VALUES(description),
+         prixAchat = VALUES(prixAchat),
+         prixVente = VALUES(prixVente),
+         prixGros = VALUES(prixGros),
+         prixPromotion = VALUES(prixPromotion),
+         quantite = VALUES(quantite),
+         seuilAlerte = VALUES(seuilAlerte),
+         imageBase64 = VALUES(imageBase64),
+         dateModification = VALUES(dateModification),
+         dateExpiration = VALUES(dateExpiration),
+         joursAlerteExpiration = VALUES(joursAlerteExpiration),
+         lastModified = VALUES(lastModified)`,
+      [
+        userId,
+        marchandiseId,
+        nom,
+        reference,
+        categorieId,
+        codebar,
+        description,
+        prixAchat,
+        prixVente,
+        prixGros || 0,
+        prixPromotion || 0,
+        quantite,
+        seuilAlerte || 5,
+        imageBase64,
+        now,
+        now,
+        dateExpiration,
+        joursAlerteExpiration || 30,
+        deviceId,
+        now,
+      ],
+    );
+
+    // Si INSERT, result.insertId existe
+    // Si UPDATE, récupérer l'ID existant
+    let productId = result.insertId;
+    if (!productId) {
+      const [existing] = await pool.query(
+        'SELECT id FROM produits WHERE userId = ? AND marchandiseId = ? AND reference = ?',
+        [userId, marchandiseId, reference]
+      );
+      productId = existing[0]?.id;
+    }
+
+    const [rows] = await pool.query('SELECT * FROM produits WHERE id = ?', [productId]);
+    res.status(201).json(rows[0]);
+  } catch (e) {
+    console.error('Erreur POST /produits:', e);
+    
+    // Gérer spécifiquement les erreurs de connexion
+    if (e.code === 'PROTOCOL_CONNECTION_LOST' || 
+        e.code === 'ETIMEDOUT' ||
+        e.code === 'ER_NET_READ_INTERRUPTED') {
+      res.status(503).json({ 
+        error: 'Service temporairement indisponible',
+        code: e.code,
+        message: 'Connexion MySQL perdue, veuillez réessayer'
+      });
+      return;
+    }
+    
+    // Gérer duplicate entry (ne devrait plus arriver avec ON DUPLICATE KEY UPDATE)
+    if (e.code === 'ER_DUP_ENTRY') {
+      // Si ça arrive quand même, essayer de récupérer l'ID existant
+      try {
+        const { userId, marchandiseId, reference } = req.body;
+        const [existing] = await pool.query(
+          'SELECT id FROM produits WHERE userId = ? AND marchandiseId = ? AND reference = ?',
+          [userId, marchandiseId, reference]
+        );
+        if (existing[0]) {
+          const [rows] = await pool.query('SELECT * FROM produits WHERE id = ?', [existing[0].id]);
+          res.status(200).json(rows[0]);
+          return;
+        }
+      } catch (err) {
+        // Ignorer
+      }
+      res.status(409).json({ 
+        error: 'Entrée dupliquée',
+        code: e.code,
+        message: e.sqlMessage
+      });
+      return;
+    }
+    
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.put('/api/produits/:id', authMiddleware, async (req, res) => {
+  const userId = req.userId; // ✅ Extrait du JWT
+  try {
+    const {
+      marchandiseId,
+      userId,
+      nom,
+      reference,
+      categorieId,
+      codebar,
+      description,
+      prixAchat,
+      prixVente,
+      prixGros,
+      prixPromotion,
+      quantite,
+      seuilAlerte,
+      imageBase64,
+      dateExpiration,
+      joursAlerteExpiration,
+      deviceId,
+    } = req.body;
+
+    const now = new Date();
+    
+    console.log(`📝 PUT /api/produits/${req.params.id} - Modification du produit`);
+    
+    // PUT = UPDATE uniquement, PAS de création
+    // NE PAS modifier userId, marchandiseId, reference (contrainte UNIQUE)
+    const [result] = await pool.query(
+      `UPDATE produits SET
+         nom = COALESCE(?, nom),
+         categorieId = COALESCE(?, categorieId),
+         codebar = COALESCE(?, codebar),
+         description = COALESCE(?, description),
+         prixAchat = COALESCE(?, prixAchat),
+         prixVente = COALESCE(?, prixVente),
+         prixGros = COALESCE(?, prixGros),
+         prixPromotion = COALESCE(?, prixPromotion),
+         quantite = COALESCE(?, quantite),
+         seuilAlerte = COALESCE(?, seuilAlerte),
+         imageBase64 = COALESCE(?, imageBase64),
+         dateModification = ?,
+         dateExpiration = COALESCE(?, dateExpiration),
+         joursAlerteExpiration = COALESCE(?, joursAlerteExpiration),
+         lastModified = ?
+       WHERE id = ?`,
+      [
+        nom,
+        categorieId,
+        codebar,
+        description,
+        prixAchat,
+        prixVente,
+        prixGros,
+        prixPromotion,
+        quantite,
+        seuilAlerte,
+        imageBase64,
+        now,
+        dateExpiration,
+        joursAlerteExpiration,
+        now,
+        req.params.id,
+      ]
+    );
+
+    // Si le produit n'existe pas, ignorer silencieusement (sera créé par POST plus tard)
+    if (result.affectedRows === 0) {
+      console.log(`⚠️ Produit #${req.params.id} introuvable - UPDATE ignoré (sera créé par POST)`);
+      // Retourner un objet vide pour ne pas bloquer la sync
+      return res.status(200).json({ id: req.params.id, message: 'En attente de création' });
+    }
+    
+    console.log(`✅ Produit #${req.params.id} mis à jour avec succès`)
+
+    const [rows] = await pool.query('SELECT * FROM produits WHERE id = ?', [req.params.id]);
+    res.json(rows[0]);
+  } catch (e) {
+    console.error('Erreur PUT /produits/:id:', e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.delete('/api/produits/:id', authMiddleware, async (req, res) => {
+  const userId = req.userId; // ✅ Extrait du JWT
+  try {
+    const [result] = await pool.query('DELETE FROM produits WHERE id = ?', [req.params.id]);
+    if (result.affectedRows === 0) return res.status(404).json({ error: 'Produit non trouvé' });
+    res.json({ success: true });
+  } catch (e) {
+    console.error('Erreur DELETE /produits/:id:', e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ==================== VENTES ====================
+
+app.get('/api/ventes', authMiddleware, async (req, res) => {
+  const userId = req.userId; // ✅ Extrait du JWT
+  const maxRetries = 3;
+  let retries = 0;
+  
+  while (retries < maxRetries) {
+    try {
+      const [rows] = await pool.query('SELECT * FROM ventes ORDER BY dateVente DESC LIMIT 500');
+      res.json(rows);
+      return;
+    } catch (e) {
+      retries++;
+      console.error(`Erreur GET /ventes (tentative ${retries}/${maxRetries}):`, e);
+      
+      if ((e.code === 'PROTOCOL_CONNECTION_LOST' || 
+           e.code === 'ETIMEDOUT' ||
+           e.code === 'ER_NET_READ_INTERRUPTED') && 
+          retries < maxRetries) {
+        const delaySeconds = retries * 3; // Délai progressif: 3s, 6s, 9s
+        console.log(`🔄 Reconnexion dans ${delaySeconds} secondes... (${retries}/${maxRetries})`);
+        await new Promise(resolve => setTimeout(resolve, delaySeconds * 1000));
+        continue;
+      }
+      
+      res.status(500).json({ error: e.message });
+      return;
+    }
+  }
+});
+
+app.get('/api/ventes/:id', async (req, res) => {
+  try {
+    const [rows] = await pool.query('SELECT * FROM ventes WHERE id = ?', [req.params.id]);
+    if (rows.length === 0) return res.status(404).json({ error: 'Vente non trouvée' });
+    res.json(rows[0]);
+  } catch (e) {
+    console.error('Erreur GET /ventes/:id:', e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.post('/api/ventes', authMiddleware, async (req, res) => {
+  const userId = req.userId; // ✅ Extrait du JWT
+  try {
+    const {
+      marchandiseId = 1,
+      clientId = null,
+      numeroFacture = null,
+      dateVente = new Date(),
+      montantTotal,
+      montantPaye = 0,
+      statut = 'en_attente',
+      notes = null,
+      deviceId = null,
+    } = req.body;
+
+    if (montantTotal == null) {
+      return res.status(400).json({ error: 'montantTotal est obligatoire' });
+    }
+
+    const [result] = await pool.query(
+      `INSERT INTO ventes
+       (marchandiseId, clientId, numeroFacture, dateVente, montantTotal, montantPaye,
+        statut, notes, deviceId, lastModified)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      [marchandiseId, clientId, numeroFacture, dateVente, montantTotal, montantPaye,
+       statut, notes, deviceId, new Date()],
+    );
+
+    const [rows] = await pool.query('SELECT * FROM ventes WHERE id = ?', [result.insertId]);
+    res.status(201).json(rows[0]);
+  } catch (e) {
+    console.error('Erreur POST /ventes:', e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.put('/api/ventes/:id', authMiddleware, async (req, res) => {
+  const userId = req.userId; // ✅ Extrait du JWT
+  try {
+    const {
+      clientId,
+      numeroFacture,
+      dateVente,
+      montantTotal,
+      montantPaye,
+      statut,
+      notes,
+    } = req.body;
+
+    const [result] = await pool.query(
+      `UPDATE ventes SET
+         clientId = COALESCE(?, clientId),
+         numeroFacture = COALESCE(?, numeroFacture),
+         dateVente = COALESCE(?, dateVente),
+         montantTotal = COALESCE(?, montantTotal),
+         montantPaye = COALESCE(?, montantPaye),
+         statut = COALESCE(?, statut),
+         notes = COALESCE(?, notes),
+         lastModified = ?
+       WHERE id = ?`,
+      [
+        clientId, numeroFacture, dateVente, montantTotal, montantPaye,
+        statut, notes, new Date(), req.params.id,
+      ],
+    );
+
+    if (result.affectedRows === 0) return res.status(404).json({ error: 'Vente non trouvée' });
+
+    const [rows] = await pool.query('SELECT * FROM ventes WHERE id = ?', [req.params.id]);
+    res.json(rows[0]);
+  } catch (e) {
+    console.error('Erreur PUT /ventes/:id:', e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.delete('/api/ventes/:id', authMiddleware, async (req, res) => {
+  const userId = req.userId; // ✅ Extrait du JWT
+  try {
+    const [result] = await pool.query('DELETE FROM ventes WHERE id = ?', [req.params.id]);
+    if (result.affectedRows === 0) return res.status(404).json({ error: 'Vente non trouvée' });
+    res.json({ success: true });
+  } catch (e) {
+    console.error('Erreur DELETE /ventes/:id:', e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ==================== LIGNES VENTE ====================
+
+app.get('/api/lignes_vente', authMiddleware, async (req, res) => {
+  const userId = req.userId; // ✅ Extrait du JWT
+  try {
+    const [rows] = await pool.query('SELECT * FROM lignes_vente ORDER BY id DESC LIMIT 1000');
+    res.json(rows);
+  } catch (e) {
+    console.error('Erreur GET /lignes_vente:', e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.post('/api/lignes_vente', authMiddleware, async (req, res) => {
+  const userId = req.userId; // ✅ Extrait du JWT
+  try {
+    const {
+      venteId,
+      produitId,
+      quantite,
+      prixUnitaire,
+      montantLigne,
+      userId = 1,
+    } = req.body;
+
+    if (!venteId || !produitId || quantite == null || prixUnitaire == null) {
+      return res.status(400).json({ error: 'Champs obligatoires manquants' });
+    }
+
+    const [result] = await pool.query(
+      `INSERT INTO lignes_vente (venteId, produitId, quantite, prixUnitaire, montantLigne, userId)
+       VALUES (?, ?, ?, ?, ?, ?)
+       ON DUPLICATE KEY UPDATE
+         quantite = VALUES(quantite),
+         prixUnitaire = VALUES(prixUnitaire),
+         montantLigne = VALUES(montantLigne)`,
+      [venteId, produitId, quantite, prixUnitaire, montantLigne || (quantite * prixUnitaire), userId],
+    );
+
+    const productId = result.insertId || (await pool.query(
+      'SELECT id FROM lignes_vente WHERE venteId = ? AND produitId = ?',
+      [venteId, produitId]
+    ))[0][0]?.id;
+
+    const [rows] = await pool.query('SELECT * FROM lignes_vente WHERE id = ?', [productId || result.insertId]);
+    res.status(201).json(rows[0] || rows);
+  } catch (e) {
+    console.error('Erreur POST /lignes_vente:', e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ==================== LIGNES ACHAT ====================
+
+app.get('/api/lignes_achat', authMiddleware, async (req, res) => {
+  const userId = req.userId; // ✅ Extrait du JWT
+  try {
+    const [rows] = await pool.query('SELECT * FROM lignes_achat ORDER BY id DESC LIMIT 1000');
+    res.json(rows);
+  } catch (e) {
+    console.error('Erreur GET /lignes_achat:', e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.post('/api/lignes_achat', authMiddleware, async (req, res) => {
+  const userId = req.userId; // ✅ Extrait du JWT
+  try {
+    const {
+      achatId,
+      produitId,
+      quantite,
+      prixUnitaire,
+      montantLigne,
+      userId = 1,
+    } = req.body;
+
+    if (!achatId || !produitId || quantite == null || prixUnitaire == null) {
+      return res.status(400).json({ error: 'Champs obligatoires manquants' });
+    }
+
+    const [result] = await pool.query(
+      `INSERT INTO lignes_achat (achatId, produitId, quantite, prixUnitaire, montantLigne, userId)
+       VALUES (?, ?, ?, ?, ?, ?)
+       ON DUPLICATE KEY UPDATE
+         quantite = VALUES(quantite),
+         prixUnitaire = VALUES(prixUnitaire),
+         montantLigne = VALUES(montantLigne)`,
+      [achatId, produitId, quantite, prixUnitaire, montantLigne || (quantite * prixUnitaire), userId],
+    );
+
+    const productId = result.insertId || (await pool.query(
+      'SELECT id FROM lignes_achat WHERE achatId = ? AND produitId = ?',
+      [achatId, produitId]
+    ))[0][0]?.id;
+
+    const [rows] = await pool.query('SELECT * FROM lignes_achat WHERE id = ?', [productId || result.insertId]);
+    res.status(201).json(rows[0] || rows);
+  } catch (e) {
+    console.error('Erreur POST /lignes_achat:', e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ==================== ACHATS ====================
+
+app.get('/api/achats', authMiddleware, async (req, res) => {
+  const userId = req.userId; // ✅ Extrait du JWT
+  const maxRetries = 3;
+  let retries = 0;
+  
+  while (retries < maxRetries) {
+    try {
+      const [rows] = await pool.query('SELECT * FROM achats ORDER BY dateAchat DESC LIMIT 500');
+      res.json(rows);
+      return;
+    } catch (e) {
+      retries++;
+      console.error(`Erreur GET /achats (tentative ${retries}/${maxRetries}):`, e);
+      
+      if ((e.code === 'PROTOCOL_CONNECTION_LOST' || 
+           e.code === 'ETIMEDOUT' ||
+           e.code === 'ER_NET_READ_INTERRUPTED') && 
+          retries < maxRetries) {
+        const delaySeconds = retries * 3; // Délai progressif: 3s, 6s, 9s
+        console.log(`🔄 Reconnexion dans ${delaySeconds} secondes... (${retries}/${maxRetries})`);
+        await new Promise(resolve => setTimeout(resolve, delaySeconds * 1000));
+        continue;
+      }
+      
+      res.status(500).json({ error: e.message });
+      return;
+    }
+  }
+});
+
+app.get('/api/achats/:id', async (req, res) => {
+  try {
+    const [rows] = await pool.query('SELECT * FROM achats WHERE id = ?', [req.params.id]);
+    if (rows.length === 0) return res.status(404).json({ error: 'Achat non trouvé' });
+    res.json(rows[0]);
+  } catch (e) {
+    console.error('Erreur GET /achats/:id:', e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.post('/api/achats', authMiddleware, async (req, res) => {
+  const userId = req.userId; // ✅ Extrait du JWT
+  try {
+    const {
+      marchandiseId = 1,
+      fournisseurId = null,
+      dateAchat = new Date(),
+      montantTotal,
+      montantPaye = 0,
+      statut = 'en_attente',
+      notes = null,
+      deviceId = null,
+    } = req.body;
+
+    if (montantTotal == null) {
+      return res.status(400).json({ error: 'montantTotal est obligatoire' });
+    }
+
+    const [result] = await pool.query(
+      `INSERT INTO achats
+       (marchandiseId, fournisseurId, dateAchat, montantTotal, montantPaye,
+        statut, notes, deviceId, lastModified)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      [marchandiseId, fournisseurId, dateAchat, montantTotal, montantPaye,
+       statut, notes, deviceId, new Date()],
+    );
+
+    const [rows] = await pool.query('SELECT * FROM achats WHERE id = ?', [result.insertId]);
+    res.status(201).json(rows[0]);
+  } catch (e) {
+    console.error('Erreur POST /achats:', e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.put('/api/achats/:id', authMiddleware, async (req, res) => {
+  const userId = req.userId; // ✅ Extrait du JWT
+  try {
+    const {
+      fournisseurId,
+      dateAchat,
+      montantTotal,
+      montantPaye,
+      statut,
+      notes,
+    } = req.body;
+
+    const [result] = await pool.query(
+      `UPDATE achats SET
+         fournisseurId = COALESCE(?, fournisseurId),
+         dateAchat = COALESCE(?, dateAchat),
+         montantTotal = COALESCE(?, montantTotal),
+         montantPaye = COALESCE(?, montantPaye),
+         statut = COALESCE(?, statut),
+         notes = COALESCE(?, notes),
+         lastModified = ?
+       WHERE id = ?`,
+      [
+        fournisseurId, dateAchat, montantTotal, montantPaye,
+        statut, notes, new Date(), req.params.id,
+      ],
+    );
+
+    if (result.affectedRows === 0) return res.status(404).json({ error: 'Achat non trouvé' });
+
+    const [rows] = await pool.query('SELECT * FROM achats WHERE id = ?', [req.params.id]);
+    res.json(rows[0]);
+  } catch (e) {
+    console.error('Erreur PUT /achats/:id:', e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.delete('/api/achats/:id', authMiddleware, async (req, res) => {
+  const userId = req.userId; // ✅ Extrait du JWT
+  try {
+    const [result] = await pool.query('DELETE FROM achats WHERE id = ?', [req.params.id]);
+    if (result.affectedRows === 0) return res.status(404).json({ error: 'Achat non trouvé' });
+    res.json({ success: true });
+  } catch (e) {
+    console.error('Erreur DELETE /achats/:id:', e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ==================== DEPENSES ====================
+
+app.get('/api/depenses', authMiddleware, async (req, res) => {
+  const userId = req.userId; // ✅ Extrait du JWT
+  const maxRetries = 3;
+  let retries = 0;
+  
+  while (retries < maxRetries) {
+    try {
+      const [rows] = await pool.query('SELECT * FROM depenses ORDER BY dateDepense DESC LIMIT 500');
+      res.json(rows);
+      return;
+    } catch (e) {
+      retries++;
+      console.error(`Erreur GET /depenses (tentative ${retries}/${maxRetries}):`, e);
+      
+      if ((e.code === 'PROTOCOL_CONNECTION_LOST' || 
+           e.code === 'ETIMEDOUT' ||
+           e.code === 'ER_NET_READ_INTERRUPTED') && 
+          retries < maxRetries) {
+        const delaySeconds = retries * 3; // Délai progressif: 3s, 6s, 9s
+        console.log(`🔄 Reconnexion dans ${delaySeconds} secondes... (${retries}/${maxRetries})`);
+        await new Promise(resolve => setTimeout(resolve, delaySeconds * 1000));
+        continue;
+      }
+      
+      res.status(500).json({ error: e.message });
+      return;
+    }
+  }
+});
+
+app.get('/api/depenses/:id', async (req, res) => {
+  try {
+    const [rows] = await pool.query('SELECT * FROM depenses WHERE id = ?', [req.params.id]);
+    if (rows.length === 0) return res.status(404).json({ error: 'Dépense non trouvée' });
+    res.json(rows[0]);
+  } catch (e) {
+    console.error('Erreur GET /depenses/:id:', e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.post('/api/depenses', authMiddleware, async (req, res) => {
+  const userId = req.userId; // ✅ Extrait du JWT
+  try {
+    const {
+      marchandiseId = 1,
+      libelle,
+      montant,
+      dateDepense = new Date(),
+      description = null,
+      categorie = null,
+      modePaiement = null,
+      deviceId = null,
+    } = req.body;
+
+    if (!libelle || montant == null) {
+      return res.status(400).json({ error: 'libelle et montant sont obligatoires' });
+    }
+
+    const now = new Date();
+    const [result] = await pool.query(
+      `INSERT INTO depenses
+       (marchandiseId, libelle, montant, dateDepense, description,
+        categorie, modePaiement, dateCreation, dateModification, deviceId, lastModified)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      [
+        marchandiseId, libelle, montant, dateDepense, description,
+        categorie, modePaiement, now, now, deviceId, now,
+      ],
+    );
+
+    const [rows] = await pool.query('SELECT * FROM depenses WHERE id = ?', [result.insertId]);
+    res.status(201).json(rows[0]);
+  } catch (e) {
+    console.error('Erreur POST /depenses:', e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.put('/api/depenses/:id', authMiddleware, async (req, res) => {
+  const userId = req.userId; // ✅ Extrait du JWT
+  try {
+    const {
+      marchandiseId = 1,
+      libelle,
+      montant,
+      dateDepense,
+      description,
+      categorie,
+      modePaiement,
+      deviceId,
+    } = req.body;
+
+    const now = new Date();
+    
+    // Utiliser INSERT ... ON DUPLICATE KEY UPDATE pour un véritable UPSERT
+    // Cela met à jour si l'ID existe, ou insère si nouveau
+    await pool.query(
+      `INSERT INTO depenses
+       (id, marchandiseId, libelle, montant, dateDepense, description,
+        categorie, modePaiement, dateCreation, dateModification, deviceId, lastModified)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+       ON DUPLICATE KEY UPDATE
+         marchandiseId = COALESCE(VALUES(marchandiseId), marchandiseId),
+         libelle = COALESCE(VALUES(libelle), libelle),
+         montant = COALESCE(VALUES(montant), montant),
+         dateDepense = COALESCE(VALUES(dateDepense), dateDepense),
+         description = COALESCE(VALUES(description), description),
+         categorie = COALESCE(VALUES(categorie), categorie),
+         modePaiement = COALESCE(VALUES(modePaiement), modePaiement),
+         dateModification = VALUES(dateModification),
+         lastModified = VALUES(lastModified)`,
+      [
+        req.params.id,
+        marchandiseId,
+        libelle,
+        montant,
+        dateDepense,
+        description,
+        categorie,
+        modePaiement,
+        now,
+        now,
+        deviceId,
+        now,
+      ],
+    );
+
+    const [rows] = await pool.query('SELECT * FROM depenses WHERE id = ?', [req.params.id]);
+    res.json(rows[0]);
+  } catch (e) {
+    console.error('Erreur PUT /depenses/:id:', e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.delete('/api/depenses/:id', authMiddleware, async (req, res) => {
+  const userId = req.userId; // ✅ Extrait du JWT
+  try {
+    const [result] = await pool.query('DELETE FROM depenses WHERE id = ?', [req.params.id]);
+    if (result.affectedRows === 0) return res.status(404).json({ error: 'Dépense non trouvée' });
+    res.json({ success: true });
+  } catch (e) {
+    console.error('Erreur DELETE /depenses/:id:', e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ==================== CLIENTS ====================
+
+app.get('/api/clients', authMiddleware, async (req, res) => {
+  const userId = req.userId; // ✅ Extrait du JWT
+  try {
+    const [rows] = await pool.query(
+      'SELECT * FROM clients ORDER BY nom ASC LIMIT 1000',
+    );
+    res.json(rows);
+  } catch (e) {
+    console.error('Erreur GET /clients:', e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.get('/api/clients/:id', async (req, res) => {
+  try {
+    const [rows] = await pool.query('SELECT * FROM clients WHERE id = ?', [
+      req.params.id,
+    ]);
+    if (rows.length === 0) {
+      return res.status(404).json({ error: 'Client non trouvé' });
+    }
+    res.json(rows[0]);
+  } catch (e) {
+    console.error('Erreur GET /clients/:id:', e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.post('/api/clients', authMiddleware, async (req, res) => {
+  const userId = req.userId; // ✅ Extrait du JWT
+  try {
+    const {
+      marchandiseId = 1,
+      nom,
+      prenom = null,
+      entreprise = null,
+      email = null,
+      telephone = null,
+      adresse = null,
+      solde = 0,
+      ice = null,
+      rc = null,
+    } = req.body;
+
+    if (!nom) {
+      return res
+        .status(400)
+        .json({ error: 'Le champ nom est obligatoire' });
+    }
+
+    const now = new Date();
+    const [result] = await pool.query(
+      `INSERT INTO clients
+       (marchandiseId, nom, prenom, entreprise, email, telephone,
+        adresse, solde, ice, rc, dateCreation)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      [
+        marchandiseId,
+        nom,
+        prenom,
+        entreprise,
+        email,
+        telephone,
+        adresse,
+        solde,
+        ice,
+        rc,
+        now,
+      ],
+    );
+
+    const [rows] = await pool.query('SELECT * FROM clients WHERE id = ?', [
+      result.insertId,
+    ]);
+    res.status(201).json(rows[0]);
+  } catch (e) {
+    console.error('Erreur POST /clients:', e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.put('/api/clients/:id', authMiddleware, async (req, res) => {
+  const userId = req.userId; // ✅ Extrait du JWT
+  try {
+    const {
+      marchandiseId = 1,
+      nom,
+      prenom,
+      entreprise,
+      email,
+      telephone,
+      adresse,
+      solde,
+      ice,
+      rc,
+    } = req.body;
+
+    const now = new Date();
+    
+    // Utiliser INSERT ... ON DUPLICATE KEY UPDATE pour un véritable UPSERT
+    // Cela met à jour si l'ID existe, ou insère si nouveau
+    await pool.query(
+      `INSERT INTO clients
+       (id, marchandiseId, nom, prenom, entreprise, email, telephone,
+        adresse, solde, ice, rc, dateCreation)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+       ON DUPLICATE KEY UPDATE
+         marchandiseId = COALESCE(VALUES(marchandiseId), marchandiseId),
+         nom = COALESCE(VALUES(nom), nom),
+         prenom = COALESCE(VALUES(prenom), prenom),
+         entreprise = COALESCE(VALUES(entreprise), entreprise),
+         email = COALESCE(VALUES(email), email),
+         telephone = COALESCE(VALUES(telephone), telephone),
+         adresse = COALESCE(VALUES(adresse), adresse),
+         solde = COALESCE(VALUES(solde), solde),
+         ice = COALESCE(VALUES(ice), ice),
+         rc = COALESCE(VALUES(rc), rc)`,
+      [
+        req.params.id,
+        marchandiseId,
+        nom,
+        prenom,
+        entreprise,
+        email,
+        telephone,
+        adresse,
+        solde,
+        ice,
+        rc,
+        now,
+      ],
+    );
+
+    const [rows] = await pool.query('SELECT * FROM clients WHERE id = ?', [
+      req.params.id,
+    ]);
+    res.json(rows[0]);
+  } catch (e) {
+    console.error('Erreur PUT /clients/:id:', e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.delete('/api/clients/:id', authMiddleware, async (req, res) => {
+  const userId = req.userId; // ✅ Extrait du JWT
+  try {
+    const [result] = await pool.query('DELETE FROM clients WHERE id = ?', [
+      req.params.id,
+    ]);
+    if (result.affectedRows === 0) {
+      return res.status(404).json({ error: 'Client non trouvé' });
+    }
+    res.json({ success: true });
+  } catch (e) {
+    console.error('Erreur DELETE /clients/:id:', e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ==================== FOURNISSEURS ====================
+
+app.get('/api/fournisseurs', authMiddleware, async (req, res) => {
+  const userId = req.userId; // ✅ Extrait du JWT
+  try {
+    const [rows] = await pool.query(
+      'SELECT * FROM fournisseurs ORDER BY nom ASC LIMIT 1000',
+    );
+    res.json(rows);
+  } catch (e) {
+    console.error('Erreur GET /fournisseurs:', e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.get('/api/fournisseurs/:id', async (req, res) => {
+  try {
+    const [rows] = await pool.query(
+      'SELECT * FROM fournisseurs WHERE id = ?',
+      [req.params.id],
+    );
+    if (rows.length === 0) {
+      return res.status(404).json({ error: 'Fournisseur non trouvé' });
+    }
+    res.json(rows[0]);
+  } catch (e) {
+    console.error('Erreur GET /fournisseurs/:id:', e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.post('/api/fournisseurs', authMiddleware, async (req, res) => {
+  const userId = req.userId; // ✅ Extrait du JWT
+  try {
+    const {
+      marchandiseId = 1,
+      nom,
+      tele = null,
+      adress = null,
+      solde = 0,
+      ice = null,
+      rc = null,
+    } = req.body;
+
+    if (!nom) {
+      return res
+        .status(400)
+        .json({ error: 'Le champ nom est obligatoire' });
+    }
+
+    const now = new Date();
+    const [result] = await pool.query(
+      `INSERT INTO fournisseurs
+       (marchandiseId, nom, tele, adress, solde, ice, rc,
+        dateCreation, dateModification)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      [
+        marchandiseId,
+        nom,
+        tele,
+        adress,
+        solde,
+        ice,
+        rc,
+        now,
+        now,
+      ],
+    );
+
+    const [rows] = await pool.query(
+      'SELECT * FROM fournisseurs WHERE id = ?',
+      [result.insertId],
+    );
+    res.status(201).json(rows[0]);
+  } catch (e) {
+    console.error('Erreur POST /fournisseurs:', e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.put('/api/fournisseurs/:id', authMiddleware, async (req, res) => {
+  const userId = req.userId; // ✅ Extrait du JWT
+  try {
+    const {
+      marchandiseId = 1,
+      nom,
+      tele,
+      adress,
+      solde,
+      ice,
+      rc,
+    } = req.body;
+
+    const now = new Date();
+    
+    // Utiliser INSERT ... ON DUPLICATE KEY UPDATE pour un véritable UPSERT
+    // Cela met à jour si l'ID existe, ou insère si nouveau
+    await pool.query(
+      `INSERT INTO fournisseurs
+       (id, marchandiseId, nom, tele, adress, solde, ice, rc,
+        dateCreation, dateModification)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+       ON DUPLICATE KEY UPDATE
+         marchandiseId = COALESCE(VALUES(marchandiseId), marchandiseId),
+         nom = COALESCE(VALUES(nom), nom),
+         tele = COALESCE(VALUES(tele), tele),
+         adress = COALESCE(VALUES(adress), adress),
+         solde = COALESCE(VALUES(solde), solde),
+         ice = COALESCE(VALUES(ice), ice),
+         rc = COALESCE(VALUES(rc), rc),
+         dateModification = VALUES(dateModification)`,
+      [
+        req.params.id,
+        marchandiseId,
+        nom,
+        tele,
+        adress,
+        solde,
+        ice,
+        rc,
+        now,
+        now,
+      ],
+    );
+
+    const [rows] = await pool.query(
+      'SELECT * FROM fournisseurs WHERE id = ?',
+      [req.params.id],
+    );
+    res.json(rows[0]);
+  } catch (e) {
+    console.error('Erreur PUT /fournisseurs/:id:', e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.delete('/api/fournisseurs/:id', authMiddleware, async (req, res) => {
+  const userId = req.userId; // ✅ Extrait du JWT
+  try {
+    const [result] = await pool.query(
+      'DELETE FROM fournisseurs WHERE id = ?',
+      [req.params.id],
+    );
+    if (result.affectedRows === 0) {
+      return res.status(404).json({ error: 'Fournisseur non trouvé' });
+    }
+    res.json({ success: true });
+  } catch (e) {
+    console.error('Erreur DELETE /fournisseurs/:id:', e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ==================== RETOURS VENTES ====================
+
+app.get('/api/retours_ventes', authMiddleware, async (req, res) => {
+  const userId = req.userId; // ✅ Extrait du JWT
+  const maxRetries = 3;
+  let retries = 0;
+  
+  while (retries < maxRetries) {
+    try {
+      const [rows] = await pool.query('SELECT * FROM retours_ventes ORDER BY dateRetour DESC LIMIT 500');
+      res.json(rows);
+      return;
+    } catch (e) {
+      retries++;
+      console.error(`Erreur GET /retours_ventes (tentative ${retries}/${maxRetries}):`, e);
+      
+      if ((e.code === 'PROTOCOL_CONNECTION_LOST' || 
+           e.code === 'ETIMEDOUT' ||
+           e.code === 'ER_NET_READ_INTERRUPTED') && 
+          retries < maxRetries) {
+        const delaySeconds = retries * 3;
+        console.log(`🔄 Reconnexion dans ${delaySeconds} secondes... (${retries}/${maxRetries})`);
+        await new Promise(resolve => setTimeout(resolve, delaySeconds * 1000));
+        continue;
+      }
+      
+      res.status(500).json({ error: e.message });
+      return;
+    }
+  }
+});
+
+app.get('/api/retours_ventes/:id', async (req, res) => {
+  try {
+    const [rows] = await pool.query('SELECT * FROM retours_ventes WHERE id = ?', [req.params.id]);
+    if (rows.length === 0) return res.status(404).json({ error: 'Retour de vente non trouvé' });
+    res.json(rows[0]);
+  } catch (e) {
+    console.error('Erreur GET /retours_ventes/:id:', e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.post('/api/retours_ventes', authMiddleware, async (req, res) => {
+  const userId = req.userId; // ✅ Extrait du JWT
+  try {
+    const {
+      id,
+      userId = 1,
+      marchandiseId,
+      venteId,
+      clientId = null,
+      dateRetour = new Date(),
+      montantTotal,
+      statut = 'valide',
+      raison = null,
+      notes = null,
+      deviceId = null,
+    } = req.body;
+
+    if (!marchandiseId || !venteId || montantTotal == null) {
+      return res.status(400).json({ error: 'marchandiseId, venteId et montantTotal sont obligatoires' });
+    }
+
+    const now = new Date();
+    
+    // Si un ID est fourni (pour cohérence avec SQLite)
+    if (id) {
+      await pool.query(
+        `INSERT INTO retours_ventes
+         (id, userId, marchandiseId, venteId, clientId, dateRetour, montantTotal,
+          statut, raison, notes, deviceId, lastModified)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+         ON DUPLICATE KEY UPDATE
+           montantTotal = VALUES(montantTotal),
+           statut = VALUES(statut),
+           raison = VALUES(raison),
+           notes = VALUES(notes),
+           lastModified = VALUES(lastModified)`,
+        [id, userId, marchandiseId, venteId, clientId, dateRetour, montantTotal,
+         statut, raison, notes, deviceId, now],
+      );
+      
+      const [rows] = await pool.query('SELECT * FROM retours_ventes WHERE id = ?', [id]);
+      return res.status(201).json(rows[0]);
+    }
+
+    // Sinon, insertion normale
+    const [result] = await pool.query(
+      `INSERT INTO retours_ventes
+       (userId, marchandiseId, venteId, clientId, dateRetour, montantTotal,
+        statut, raison, notes, deviceId, lastModified)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      [userId, marchandiseId, venteId, clientId, dateRetour, montantTotal,
+       statut, raison, notes, deviceId, now],
+    );
+
+    const [rows] = await pool.query('SELECT * FROM retours_ventes WHERE id = ?', [result.insertId]);
+    res.status(201).json(rows[0]);
+  } catch (e) {
+    console.error('Erreur POST /retours_ventes:', e);
+    if (e.code === 'ER_DUP_ENTRY') {
+      return res.status(409).json({ error: 'Un retour avec cet ID existe déjà' });
+    }
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.put('/api/retours_ventes/:id', authMiddleware, async (req, res) => {
+  const userId = req.userId; // ✅ Extrait du JWT
+  try {
+    const {
+      userId,
+      marchandiseId,
+      venteId,
+      clientId,
+      dateRetour,
+      montantTotal,
+      statut,
+      raison,
+      notes,
+      deviceId,
+    } = req.body;
+
+    const now = new Date();
+    
+    const [result] = await pool.query(
+      `UPDATE retours_ventes SET
+         userId = COALESCE(?, userId),
+         marchandiseId = COALESCE(?, marchandiseId),
+         venteId = COALESCE(?, venteId),
+         clientId = COALESCE(?, clientId),
+         dateRetour = COALESCE(?, dateRetour),
+         montantTotal = COALESCE(?, montantTotal),
+         statut = COALESCE(?, statut),
+         raison = COALESCE(?, raison),
+         notes = COALESCE(?, notes),
+         deviceId = COALESCE(?, deviceId),
+         lastModified = ?
+       WHERE id = ?`,
+      [userId, marchandiseId, venteId, clientId, dateRetour, montantTotal,
+       statut, raison, notes, deviceId, now, req.params.id],
+    );
+
+    if (result.affectedRows === 0) {
+      return res.status(404).json({ error: 'Retour de vente non trouvé' });
+    }
+
+    const [rows] = await pool.query('SELECT * FROM retours_ventes WHERE id = ?', [req.params.id]);
+    res.json(rows[0]);
+  } catch (e) {
+    console.error('Erreur PUT /retours_ventes/:id:', e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.delete('/api/retours_ventes/:id', authMiddleware, async (req, res) => {
+  const userId = req.userId; // ✅ Extrait du JWT
+  try {
+    // Supprimer les lignes de retour associées d'abord
+    await pool.query('DELETE FROM lignes_retour_vente WHERE retourVenteId = ?', [req.params.id]);
+    
+    const [result] = await pool.query('DELETE FROM retours_ventes WHERE id = ?', [req.params.id]);
+    if (result.affectedRows === 0) {
+      return res.status(404).json({ error: 'Retour de vente non trouvé' });
+    }
+    res.json({ success: true });
+  } catch (e) {
+    console.error('Erreur DELETE /retours_ventes/:id:', e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ==================== RETOURS ACHATS ====================
+
+app.get('/api/retours_achats', authMiddleware, async (req, res) => {
+  const userId = req.userId; // ✅ Extrait du JWT
+  const maxRetries = 3;
+  let retries = 0;
+  
+  while (retries < maxRetries) {
+    try {
+      const [rows] = await pool.query('SELECT * FROM retours_achats ORDER BY dateRetour DESC LIMIT 500');
+      res.json(rows);
+      return;
+    } catch (e) {
+      retries++;
+      console.error(`Erreur GET /retours_achats (tentative ${retries}/${maxRetries}):`, e);
+      
+      if ((e.code === 'PROTOCOL_CONNECTION_LOST' || 
+           e.code === 'ETIMEDOUT' ||
+           e.code === 'ER_NET_READ_INTERRUPTED') && 
+          retries < maxRetries) {
+        const delaySeconds = retries * 3;
+        console.log(`🔄 Reconnexion dans ${delaySeconds} secondes... (${retries}/${maxRetries})`);
+        await new Promise(resolve => setTimeout(resolve, delaySeconds * 1000));
+        continue;
+      }
+      
+      res.status(500).json({ error: e.message });
+      return;
+    }
+  }
+});
+
+app.get('/api/retours_achats/:id', async (req, res) => {
+  try {
+    const [rows] = await pool.query('SELECT * FROM retours_achats WHERE id = ?', [req.params.id]);
+    if (rows.length === 0) return res.status(404).json({ error: 'Retour d\'achat non trouvé' });
+    res.json(rows[0]);
+  } catch (e) {
+    console.error('Erreur GET /retours_achats/:id:', e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.post('/api/retours_achats', authMiddleware, async (req, res) => {
+  const userId = req.userId; // ✅ Extrait du JWT
+  try {
+    const {
+      id,
+      userId = 1,
+      marchandiseId,
+      achatId,
+      fournisseurId = null,
+      dateRetour = new Date(),
+      montantTotal,
+      statut = 'valide',
+      raison = null,
+      notes = null,
+      deviceId = null,
+    } = req.body;
+
+    if (!marchandiseId || !achatId || montantTotal == null) {
+      return res.status(400).json({ error: 'marchandiseId, achatId et montantTotal sont obligatoires' });
+    }
+
+    const now = new Date();
+    
+    // Si un ID est fourni (pour cohérence avec SQLite)
+    if (id) {
+      await pool.query(
+        `INSERT INTO retours_achats
+         (id, userId, marchandiseId, achatId, fournisseurId, dateRetour, montantTotal,
+          statut, raison, notes, deviceId, lastModified)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+         ON DUPLICATE KEY UPDATE
+           montantTotal = VALUES(montantTotal),
+           statut = VALUES(statut),
+           raison = VALUES(raison),
+           notes = VALUES(notes),
+           lastModified = VALUES(lastModified)`,
+        [id, userId, marchandiseId, achatId, fournisseurId, dateRetour, montantTotal,
+         statut, raison, notes, deviceId, now],
+      );
+      
+      const [rows] = await pool.query('SELECT * FROM retours_achats WHERE id = ?', [id]);
+      return res.status(201).json(rows[0]);
+    }
+
+    // Sinon, insertion normale
+    const [result] = await pool.query(
+      `INSERT INTO retours_achats
+       (userId, marchandiseId, achatId, fournisseurId, dateRetour, montantTotal,
+        statut, raison, notes, deviceId, lastModified)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      [userId, marchandiseId, achatId, fournisseurId, dateRetour, montantTotal,
+       statut, raison, notes, deviceId, now],
+    );
+
+    const [rows] = await pool.query('SELECT * FROM retours_achats WHERE id = ?', [result.insertId]);
+    res.status(201).json(rows[0]);
+  } catch (e) {
+    console.error('Erreur POST /retours_achats:', e);
+    if (e.code === 'ER_DUP_ENTRY') {
+      return res.status(409).json({ error: 'Un retour avec cet ID existe déjà' });
+    }
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.put('/api/retours_achats/:id', authMiddleware, async (req, res) => {
+  const userId = req.userId; // ✅ Extrait du JWT
+  try {
+    const {
+      userId,
+      marchandiseId,
+      achatId,
+      fournisseurId,
+      dateRetour,
+      montantTotal,
+      statut,
+      raison,
+      notes,
+      deviceId,
+    } = req.body;
+
+    const now = new Date();
+    
+    const [result] = await pool.query(
+      `UPDATE retours_achats SET
+         userId = COALESCE(?, userId),
+         marchandiseId = COALESCE(?, marchandiseId),
+         achatId = COALESCE(?, achatId),
+         fournisseurId = COALESCE(?, fournisseurId),
+         dateRetour = COALESCE(?, dateRetour),
+         montantTotal = COALESCE(?, montantTotal),
+         statut = COALESCE(?, statut),
+         raison = COALESCE(?, raison),
+         notes = COALESCE(?, notes),
+         deviceId = COALESCE(?, deviceId),
+         lastModified = ?
+       WHERE id = ?`,
+      [userId, marchandiseId, achatId, fournisseurId, dateRetour, montantTotal,
+       statut, raison, notes, deviceId, now, req.params.id],
+    );
+
+    if (result.affectedRows === 0) {
+      return res.status(404).json({ error: 'Retour d\'achat non trouvé' });
+    }
+
+    const [rows] = await pool.query('SELECT * FROM retours_achats WHERE id = ?', [req.params.id]);
+    res.json(rows[0]);
+  } catch (e) {
+    console.error('Erreur PUT /retours_achats/:id:', e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.delete('/api/retours_achats/:id', authMiddleware, async (req, res) => {
+  const userId = req.userId; // ✅ Extrait du JWT
+  try {
+    // Supprimer les lignes de retour associées d'abord
+    await pool.query('DELETE FROM lignes_retour_achat WHERE retourAchatId = ?', [req.params.id]);
+    
+    const [result] = await pool.query('DELETE FROM retours_achats WHERE id = ?', [req.params.id]);
+    if (result.affectedRows === 0) {
+      return res.status(404).json({ error: 'Retour d\'achat non trouvé' });
+    }
+    res.json({ success: true });
+  } catch (e) {
+    console.error('Erreur DELETE /retours_achats/:id:', e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ==================== LIGNES RETOUR VENTE ====================
+const lignesRetourVenteRouter = require('./routes/lignes_retour_vente');
+app.use('/api/lignes_retour_vente', lignesRetourVenteRouter);
+
+// ==================== LIGNES RETOUR ACHAT ====================
+const lignesRetourAchatRouter = require('./routes/lignes_retour_achat');
+app.use('/api/lignes_retour_achat', lignesRetourAchatRouter);
+
+// ==================== REGLEMENTS CLIENTS ====================
+const reglementsClientsRouter = require('./routes/reglements_clients');
+app.use('/api/reglements_clients', reglementsClientsRouter);
+
+// ==================== REGLEMENTS FOURNISSEURS ====================
+const reglementsFournisseursRouter = require('./routes/reglements_fournisseurs');
+app.use('/api/reglements_fournisseurs', reglementsFournisseursRouter);
+
+// ✅ Middleware de gestion d'erreurs global
+app.use((err, req, res, next) => {
+  console.error('❌ Erreur API:', err);
+  
+  // Erreurs MySQL
+  if (err.code === 'PROTOCOL_CONNECTION_LOST' || 
+      err.code === 'ETIMEDOUT' ||
+      err.code === 'ER_NET_READ_INTERRUPTED') {
+    res.status(503).json({ 
+      error: 'Service temporairement indisponible',
+      code: err.code,
+      message: 'Connexion MySQL perdue, veuillez réessayer'
+    });
+    return;
+  }
+  
+  // Erreurs duplicate entry
+  if (err.code === 'ER_DUP_ENTRY') {
+    res.status(409).json({ 
+      error: 'Entrée dupliquée',
+      code: err.code,
+      message: err.sqlMessage
+    });
+    return;
+  }
+  
+  // Autres erreurs
+  res.status(500).json({ 
+    error: err.message || 'Erreur serveur',
+    code: err.code
+  });
+});
+
+app.listen(PORT, () => {
+  console.log(`✅ API MySQL démarrée sur http://localhost:${PORT}`);
+});
